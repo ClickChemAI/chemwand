@@ -2,20 +2,34 @@
 
 **Tell Claude what to draw. Get an editable ChemDraw file.**
 
-ChemWand is an [MCP](https://modelcontextprotocol.io) server that lets Claude (or any MCP client)
-produce publication-style chemistry figures as **CDXML** files — the native, fully editable
-format of ChemDraw. You describe the figure in plain language; Claude turns it into SMILES and a
-layout description; ChemWand lays it out to ACS 1996 drawing settings, checks that every structure
-reads back to the molecule that was asked for (InChI round-trip), and writes the file.
+[中文安装说明 →](README_zh.md)
 
-It runs entirely on your own computer. No account, no API key, no server. (The only network call
-is the optional PubChem lookup by compound name.)
+ChemWand is an extension for Claude that draws publication-style chemistry figures — structures,
+reaction schemes, multi-step routes, substrate-scope tables, catalytic cycles — and saves them as
+**CDXML**, the native editable format of ChemDraw. You describe the figure in plain language;
+ChemWand lays it out, checks that every structure reads back to the molecule you asked for
+(InChI round-trip), saves the file and opens it in ChemDraw.
 
-```
-You:     Draw a Suzuki coupling: 4-bromoanisole + phenylboronic acid,
-         Pd(PPh3)4, K2CO3, toluene/H2O, 90 °C → 4-methoxybiphenyl, 92%.
-Claude:  → draw_linear_scheme(...)  → the .cdxml file opens in ChemDraw
-```
+It runs on your own computer. No account, no API key, no server. (The only network call is the
+optional PubChem lookup by compound name.)
+
+## Install (2 minutes)
+
+You need **Claude Desktop** ([download](https://claude.com/download)) and **ChemDraw**. Nothing else —
+Claude installs Python and everything ChemWand needs by itself.
+
+1. Download **[chemwand.mcpb](https://github.com/ClickChemAI/chemwand/releases/latest/download/chemwand.mcpb)**.
+2. Double-click it. Claude Desktop opens an install page.
+3. Click **Install**. The first install downloads Python and the chemistry libraries, so give it a
+   minute or two.
+
+That's it. Open a chat and ask:
+
+> Use ChemWand to draw ibuprofen.
+
+**The Install button is grey?** Your Claude account belongs to an organization (company or university)
+whose admin only allows approved extensions. Ask your admin to approve ChemWand, or use
+[Option B](#option-b-claude-code) below.
 
 ## What it can draw
 
@@ -35,48 +49,44 @@ Claude:  → draw_linear_scheme(...)  → the .cdxml file opens in ChemDraw
 | `check_disconnection` | atom bookkeeping for one retrosynthetic disconnection |
 | `write_procedure` | an ACS-SI-style experimental paragraph for one step |
 
-Every drawing is checked before it is written: a structure whose drawn form does not read back to
-the requested molecule is reported, not silently drawn wrong.
+Things to try:
 
-## Requirements
+- *Draw a Suzuki coupling: 4-bromoanisole + phenylboronic acid, Pd(PPh3)4, K2CO3, toluene/H2O,
+  90 °C → 4-methoxybiphenyl, 92%.*
+- *Make a substrate-scope table for this reaction; R = Me, Et, iPr, Ph, with yields 85, 80, 72, 90%.*
+- *Draw the catalytic cycle of a Buchwald–Hartwig amination.*
+- *How much of each reagent do I need for this step at 0.5 mmol?*
 
-- **macOS** or **Windows** (developed and tested on macOS 15; Windows support is newer and less tested)
-- **Python 3.10+** (tested on 3.13)
-- An MCP client — e.g. [Claude Code](https://claude.com/claude-code) or Claude Desktop
-- **ChemDraw** to view and edit the output. Without it the `.cdxml` files are still written;
-  any program that reads CDXML can open them.
+Figures are saved to `chemwand_figures` in your home folder and open in ChemDraw automatically. Ask
+for a new file name for each version — reopening a file under the same name can leave ChemDraw
+showing the old window.
 
-## Install
+## Other ways to install
 
-### The easy way: let Claude do it
+### Option B: Claude Code
 
-Download this repository (green **Code** button → *Download ZIP*, or `git clone`), open the folder
-in Claude Code, and say:
+For accounts that cannot install extensions. Download this repository (green **Code** button →
+*Download ZIP*), unzip it, open the folder in the **Code** tab of Claude Desktop (or in Claude Code),
+and say:
 
-> Install ChemWand from this folder as a local MCP server, following the README.
+> Install ChemWand from this folder as a local MCP server, following the README. If Python 3.11 or
+> newer is missing, install it in my user folder with uv.
 
-### By hand
+Then fully quit and reopen Claude, and draw from the Code tab.
+
+### Option C: by hand
+
+Requires Python 3.11–3.14 (tested on 3.13).
 
 ```bash
 git clone https://github.com/ClickChemAI/chemwand.git
 cd chemwand
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt          # Windows: venv\Scripts\pip install -r requirements.txt
+venv/bin/python -c "import asyncio, chemwand_mcp as m; print(len(asyncio.run(m.mcp.list_tools())), 'tools')"   # expect 16
 ```
 
-`requirements.txt` pins the exact versions ChemWand was tested with. If a pin has no wheel for
-your Python, install the direct dependencies instead: `pip install mcp rdkit numpy pillow uharfbuzz`.
-`uharfbuzz` matters — without it, text widths are approximated and layouts shift slightly.
-
-Check it loads (expect `16 tools`):
-
-```bash
-venv/bin/python -c "import asyncio, chemwand_mcp as m; print(len(asyncio.run(m.mcp.list_tools())), 'tools')"
-```
-
-### Register it with your client
-
-**Claude Code** (use absolute paths):
+Register it with Claude Code (absolute paths):
 
 ```bash
 # macOS
@@ -88,54 +98,20 @@ claude mcp add --scope user chemwand -- /path/to/chemwand/venv/bin/python /path/
 claude mcp add --scope user -e PYTHONUTF8=1 chemwand -- C:\path\to\chemwand\venv\Scripts\python.exe C:\path\to\chemwand\chemwand_mcp.py
 ```
 
-**Claude Desktop** — add to `claude_desktop_config.json`
-(macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`), then fully quit and
-reopen Claude Desktop. On Windows use `venv\\Scripts\\python.exe` and doubled backslashes.
-
-```json
-{
-  "mcpServers": {
-    "chemwand": {
-      "command": "/path/to/chemwand/venv/bin/python",
-      "args": ["/path/to/chemwand/chemwand_mcp.py"],
-      "env": {"PYTHONUTF8": "1"}
-    }
-  }
-}
-```
-
-Quit Claude Desktop before editing this file: it rewrites the file while running and can discard
-your change.
-
-### Optional settings (environment variables)
-
-| variable | default | |
-|---|---|---|
-| `CHEMWAND_FIG_DIR` | `~/chemwand_figures` | where figures are saved |
-| `CHEMDRAW_APP` | `ChemDraw 23.1.2.app` | macOS only: your ChemDraw's application name, **including `.app`**. Figures still open through the default `.cdxml` handler if this is wrong; only the optional clean-up step needs it. |
-| `CHEMDRAW_FONT` | auto-detected Arial | path to an Arial `.ttf`, if it is not found automatically |
-
-## Use
-
-Restart your client after registering, then just ask:
-
-- *Draw ibuprofen.*
-- *Draw this three-step route as one scheme: …*
-- *Make a substrate-scope table for this reaction; R = Me, Et, iPr, Ph, 4-MeOC6H4, with these yields: …*
-- *Draw the catalytic cycle of a Buchwald–Hartwig amination.*
-- *How much of each reagent do I need for this step at 0.5 mmol?*
-
-Figures are saved to `~/chemwand_figures/` and opened automatically. Use a new file name for each
-version — reopening a file under the same name can leave ChemDraw showing the old window.
+Optional environment variables: `CHEMWAND_FIG_DIR` (where figures are saved, default
+`~/chemwand_figures`), `CHEMDRAW_APP` (macOS: your ChemDraw's application name including `.app`,
+used only by the optional clean-up step), `CHEMDRAW_FONT` (path to an Arial `.ttf` if it is not found
+automatically).
 
 ## Notes and limitations
 
 - **Abbreviations.** A hand-written table of 41 common groups (Boc, Cbz, Fmoc, Troc, Alloc, Bn, Ph,
   OAc, OMe, OTBS, OTIPS, OTBDPS, OTMS, OPMB, OMOM, OSEM, OTHP, NHBoc, CF3, NO2, …). Groups outside
   it are drawn out in full.
-- The layout engine is tuned to ACS 1996 settings (14.4 pt bonds, 10 pt Arial).
-- Windows: file opening, file locking and font lookup have Windows code paths, but most testing was
-  on macOS. Bug reports welcome.
+- The layout follows ACS 1996 settings (14.4 pt bonds, 10 pt Arial).
+- Developed and tested on macOS. Windows has its own code paths for opening files, file locking and
+  fonts, but has had little testing — bug reports welcome in
+  [Issues](https://github.com/ClickChemAI/chemwand/issues).
 
 ## License
 

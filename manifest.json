@@ -1,0 +1,55 @@
+{
+  "manifest_version": "0.4",
+  "name": "chemwand",
+  "display_name": "ChemWand",
+  "version": "1.0.0",
+  "description": "Tell Claude what to draw, get an editable ChemDraw (CDXML) file.",
+  "long_description": "ChemWand turns plain-language requests into publication-style chemistry figures saved as CDXML, the native editable format of ChemDraw: single structures, reaction schemes, multi-step routes, substrate-scope tables, catalytic cycles and radial figures. Every structure is checked by InChI round-trip before the file is written. Figures are saved to ~/chemwand_figures and opened in ChemDraw. Runs on your own computer; the only network call is the optional PubChem lookup by compound name.",
+  "author": {
+    "name": "Ge Zhang",
+    "url": "https://github.com/ClickChemAI"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ClickChemAI/chemwand.git"
+  },
+  "homepage": "https://github.com/ClickChemAI/chemwand",
+  "support": "https://github.com/ClickChemAI/chemwand/issues",
+  "server": {
+    "type": "uv",
+    "entry_point": "chemwand_mcp.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "python", "-X", "utf8", "chemwand_mcp.py"],
+      "env": {
+        "PYTHONUTF8": "1"
+      }
+    }
+  },
+  "tools": [
+    {"name": "draw_molecule", "description": "Draw a single structure from SMILES"},
+    {"name": "draw_linear_scheme", "description": "Reaction schemes with conditions above and below the arrows"},
+    {"name": "draw_snaking_scheme", "description": "Long multi-step routes folded into equal-width rows"},
+    {"name": "draw_scope_table", "description": "Substrate-scope tables with yields, ee, dr"},
+    {"name": "draw_catalytic_cycle", "description": "Catalytic cycles and mechanism rings"},
+    {"name": "draw_radial_figure", "description": "One starting material to many products"},
+    {"name": "merge_figures", "description": "Combine figures already drawn into one file"},
+    {"name": "stereo_ingest", "description": "Read stereochemistry from a scheme"},
+    {"name": "stereo_lint", "description": "Audit stereochemistry across a scheme"},
+    {"name": "stereo_propagate", "description": "Carry stereocentres through a route"},
+    {"name": "stereo_gallery", "description": "Show the stereoisomers of a structure side by side"},
+    {"name": "molecular_properties", "description": "Formula, MW, exact mass and other reported numbers"},
+    {"name": "lookup_structure", "description": "Structure of a named compound, from PubChem"},
+    {"name": "reaction_amounts", "description": "How much of each reagent to weigh out at a given scale"},
+    {"name": "check_disconnection", "description": "Atom bookkeeping for one retrosynthetic disconnection"},
+    {"name": "write_procedure", "description": "An ACS-SI-style experimental paragraph for one step"}
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32"],
+    "runtimes": {
+      "python": ">=3.11,<3.15"
+    }
+  },
+  "keywords": ["chemistry", "chemdraw", "cdxml", "reaction scheme", "rdkit"],
+  "license": "MIT"
+}

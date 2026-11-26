@@ -1,0 +1,19 @@
+[project]
+name = "chemwand"
+version = "1.0.0"
+description = "Tell Claude what to draw, get an editable ChemDraw (CDXML) file."
+# 3.11-3.14: every pin below has wheels for these on macOS (arm64, x86_64) and
+# Windows; 3.10 is out because numpy 2.3.2 needs 3.11+. uv resolves for every
+# version in this range, so widening it needs that check redone. Only 3.13 is
+# tested, and .python-version makes uv use 3.13.
+requires-python = ">=3.11,<3.15"
+license = "MIT"
+# The versions ChemWand was tested with (Python 3.13). Same pins as the top of
+# requirements.txt; numpy and pillow are listed because the PyPI rdkit needs them.
+dependencies = [
+    "mcp==1.28.1",
+    "rdkit==2025.9.5",
+    "uharfbuzz==0.56.0",
+    "numpy==2.3.2",
+    "pillow==11.3.0",
+]
