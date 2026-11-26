@@ -2,8 +2,6 @@
 
 **Tell Claude what to draw. Get an editable ChemDraw file.**
 
-[中文安装说明 →](README_zh.md)
-
 ChemWand is an extension for Claude that draws publication-style chemistry figures — structures,
 reaction schemes, multi-step routes, substrate-scope tables, catalytic cycles — and saves them as
 **CDXML**, the native editable format of ChemDraw. You describe the figure in plain language;
