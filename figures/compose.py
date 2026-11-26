@@ -1,17 +1,20 @@
-"""compose.py — 多引擎组合原型。**一行引擎代码都没改。**
+"""compose.py - multi-engine composition prototype. **Not one line of engine code
+changed.**
 
-每个引擎照旧跑完整的一次调用（headless，产出一份完整 CDXML），组合器只在
-成品文档这一层做事：切开 <page>、重编号、平移、并集、合表、重新落到正象限。
+Each engine runs one complete call as usual (headless, producing a complete CDXML); the
+composer works only at the finished-document level: split <page>, renumber, translate,
+union, merge tables, put back in the positive quadrant.
 
-这正是 panels.py 的嵌套模型搬到文档层：每个引擎在自己的账本里量自己的 bbox，
-组合器只学到一条"这块占了这么大"。引擎之间看不见对方的墨，所以组合器自己
-补一道并集碰撞检查（report["collisions"]）。
+This is exactly panels.py's nesting model moved to the document level: each engine
+measures its own bbox in its own ledger, and the composer learns only "this block takes
+this much room". Engines cannot see each other's ink, so the composer adds its own union
+collision check (report["collisions"]).
 
     c = Composer()
     c.cycle("ring", nodes=[...], steps=[...])
     c.linear("top",  items=[...])
-    c.above("top", "ring", gap=26)          # 按墨的实际范围叠
-    c.join("tail", to="ring", at="II")      # 共享锚点：同一个物种只画一次
+    c.above("top", "ring", gap=26)          # stack by the actual extent of the ink
+    c.join("tail", to="ring", at="II")      # shared anchor: one species is drawn only once
     rep = c.write("~/chemwand_figures/x151.cdxml")
 """
 import math
@@ -30,22 +33,26 @@ import cdxdoc as CD             # noqa: E402
 import graphics as GX           # noqa: E402
 import beautify as BT           # noqa: E402
 
-# 跨部件家具的号段：在任何单个部件用得到的号之上，又在跨部件箭头（4.9M）之下，
-# 而 4.9M 本身在第 1 个部件的偏移 5M 之下。三者互不重叠。
+# id range for cross-part furniture: above any id a single part uses, and below
+# cross-part arrows (4.9M), and 4.9M itself is below part 1's offset of 5M. The three do
+# not overlap.
 FURNITURE_GID = 4_800_000
 FURNITURE_TID = 4_850_000
 
-# 每个部件分到的 id 段。引擎里最大的自动 id 是 _add_graphics 的 970000+si*20000，
-# 20 个 slot 也才 1.37M，所以 5M 的步长留了一个量级的余量。
+# id range given to each part. The largest auto id in an engine is _add_graphics's
+# 970000+si*20000; even 20 slots is only 1.37M, so a 5M stride leaves an order of
+# magnitude of headroom.
 ID_STRIDE = 5_000_000
 
-# renumber() 覆盖 6 个标量 + 4 个 id 列表，这几个它不覆盖，而 <scheme>/<step> 全靠它们。
-# 漏掉的话反应步会指向别的部件的物件，文件照样打得开。
+# renumber() covers 6 scalars + 4 id lists; it does not cover these, and <scheme>/<step>
+# rely entirely on them. Miss them and reaction steps point at another part's objects,
+# while the file still opens fine.
 _EXTRA_ID_ATTRS = ("ReactionStepReactants", "ReactionStepProducts", "ReactionStepArrows",
                    "ReactionStepObjectsAboveArrow", "ReactionStepObjectsBelowArrow",
                    "ReactionStepAtomMap", "BondOrdering", "BracketedObjectIDs",
                    "GraphicID", "SupersededBy")
-# AtomID 故意不在里面：它是化学上的原子编号（1,2,3…），不是物件 id。
+# AtomID is deliberately not in here: it is the chemical atom number (1,2,3...), not an
+# object id.
 
 _COLOR_ATTRS = ("color", "bgcolor", "bcolor", "facecolor")
 
@@ -68,10 +75,10 @@ def _table(header: str, tag: str) -> list:
     return re.findall(r'<\w+\b[^>]*/>', m.group(1)) if m else []
 
 
-# ---------------------------------------------------------------- 几何小工具
+# ---------------------------------------------------------------- small geometry helpers
 
 def _ovl(a, b):
-    """两个 bbox 的重叠 (dx, dy)，非正表示不重叠。"""
+    """Overlap (dx, dy) of two bboxes; non-positive means no overlap."""
     return (min(a[2], b[2]) - max(a[0], b[0]), min(a[3], b[3]) - max(a[1], b[1]))
 
 
@@ -103,11 +110,13 @@ _FIND_RE = re.compile(r"^\s+(graphics\[|slots\[|\S+ covers )", re.M)
 
 
 def _findings(report: dict) -> list:
-    """部件报告里真正是"发现"的那几行（covers / 越界之类），不要那一大段说明。
+    """The lines of a part report that are real "findings" (covers / out of bounds
+    etc.), without the long explanation.
 
-    这一族是**部件内部**的图元压住结构（"graphics[5] (rect) covers node:IntB by
-    7.0 pt"）。组合器的 covered() 故意不看部件内部——同来源的层序是那个引擎自己
-    的账——所以这条通道不能撤，撤了 #010 那个电极就没人报了。
+    This family is graphics **inside a part** covering a structure ("graphics[5] (rect)
+    covers node:IntB by 7.0 pt"). The composer's covered() deliberately ignores the
+    inside of a part - layer order within one source is that engine's own business - so
+    this channel cannot be removed; remove it and nobody reports #010's electrode.
     """
     out = []
     for n in (report.get("notes") or []):
@@ -117,43 +126,50 @@ def _findings(report: dict) -> list:
     return out
 
 
-# 引擎会发 28 种 NOTE，_findings 一条抬头都放不过去（量过：90 个图脚本、712 个
-# 部件、1310 行提醒，过滤器放过去 201 行，**全部**是上面那一族 graphics[N] covers
-# cell:…）。也就是说活下来的恰恰是最该沉默的那一族，而真正该端上来的那一族一条都
-# 没过——其中 11 条是"锚点一个都没匹配上，装饰直接没画"。
+# The engine emits 28 kinds of NOTE, and _findings let not a single headline through
+# (measured: 90 figure scripts, 712 parts, 1310 notice lines; the filter passed 201
+# lines, **all** of them the graphics[N] covers cell:... family above). So what survived
+# is exactly the family that should stay silent, and not one line of the family that
+# really should be surfaced got through - 11 of them were "no anchor matched at all, the
+# decoration was simply not drawn".
 #
-# 这张表挑的是一族：**你要了，它没发生**，或者**它悄悄换了别的做法**。剩下的不转
-# 发，各有各的理由：
-#   "carry placeholder labels"    395 条 / 72 张 —— 纯信息，Markush 图都有
-#   "reaches outside the page"    103 条 / 38 张 —— 部件自己的页框，build() 最后
-#                                                  会按并集重新框一次，丢掉了
-#   "graphic(s) land on top"       75 条 / 27 张 —— covered() 按画序答得更准
-#   "came through undeformed"       2 条        —— 信息，是好消息
+# This table picks one family: **you asked for it and it did not happen**, or **it
+# quietly did something else**. The rest are not forwarded, each for its own reason:
+#   "carry placeholder labels"    395 lines / 72 figures - pure information; every
+#                                                  Markush figure has it
+#   "reaches outside the page"    103 lines / 38 figures - the part's own page box;
+#                                                  build() reframes by the union at the end,
+#                                                  so it is discarded
+#   "graphic(s) land on top"       75 lines / 27 figures - covered() answers this
+#                                                  more precisely by draw order
+#   "came through undeformed"       2 lines        - information, and good news
 #
-# 挑法靠措辞，所以 test_every_forwarded_phrase_is_still_in_the_engine 把每一条钉在
-# 引擎源码上：改了措辞先红，并且说得出是哪一条。
+# The picking relies on wording, so test_every_forwarded_phrase_is_still_in_the_engine
+# pins each one to the engine source: change the wording and it goes red first, and can
+# say which one.
 _DRIFT_PHRASES = (
-    "highlight anchor(s) matched nothing",              # 11 条 / 5 张（这一轮）
-    "each match names a GROUP rather than one atom",    # 4 条 / 3 张：一条 spec 画了好几个标记
-    "'fill' anchor(s) matched something with no ring in it",   # 2 条：静默降级成 color
-    "did not match the depiction template",             # 3 条：模板没匹配上，各画各的
-    "came out of the constrained layout with uneven bonds",    # 2 条：模板被丢掉
-    "carry no group in the abbreviation table",         # 4 条：abbreviate 开了没生效
-    "is itself a Markush structure",                    # 1 条：模板本身带 R 基
-    "were drawn in FULL anyway",                        # abbreviate 收下了没照做
-    "were asked to float and could not",                # floating 收下了没照做
-    "matched no placeholder in the SMILES",             # rlabels 的键打错了
-    "had nowhere to land and were NOT written",         # AND/OR 立体标记没写进文件
-    "did not load, so every molecule was computed",     # 手画图库没加载
-    "named an id another cell already held",            # 同名 id：那个 SMILES 没画
-    "could not be built and are NOT in the file",       # 整条目缺失
-    "span(s) were not reached",                         # 跨列没生效
-    "cannot be shrunk with them",                       # 试剂缩了，它身上的装饰没跟着
+    "highlight anchor(s) matched nothing",              # 11 lines / 5 figures (this round)
+    "each match names a GROUP rather than one atom",    # 4 lines / 3 figures: one spec drew several markers
+    "'fill' anchor(s) matched something with no ring in it",   # 2 lines: silently downgraded to color
+    "did not match the depiction template",             # 3 lines: template did not match, each drawn on its own
+    "came out of the constrained layout with uneven bonds",    # 2 lines: template was discarded
+    "carry no group in the abbreviation table",         # 4 lines: abbreviate was on but had no effect
+    "is itself a Markush structure",                    # 1 line: the template itself carries R groups
+    "were drawn in FULL anyway",                        # abbreviate accepted but not honoured
+    "were asked to float and could not",                # floating accepted but not honoured
+    "matched no placeholder in the SMILES",             # rlabels key mistyped
+    "had nowhere to land and were NOT written",         # AND/OR stereo marks not written to the file
+    "did not load, so every molecule was computed",     # hand-drawn depiction library did not load
+    "named an id another cell already held",            # duplicate id: that SMILES was not drawn
+    "could not be built and are NOT in the file",       # whole entry missing
+    "span(s) were not reached",                         # column span had no effect
+    "cannot be shrunk with them",                       # reagent was shrunk, its decorations did not follow
 )
 
 
 def _drift(report: dict) -> list:
-    """"你要了，它没发生"那一族——引擎说了，而 _findings 一直扔掉的那些。"""
+    """"You asked for it and it did not happen" family - what the engine said and
+    _findings always threw away."""
     out = []
     for n in (report.get("notes") or []):
         for line in str(n).splitlines():
@@ -163,14 +179,16 @@ def _drift(report: dict) -> list:
     return out
 
 
-# ---------------------------------------------------------------- 部件
+# ---------------------------------------------------------------- parts
 
-# ALIGN 有两套词，而调用者不该记得自己在跟哪一层说话。panels.py 说
-# start/center/end；这里按轴说 left/right 或 top/bottom，因为"左"在竖着叠时
-# 有意义、在横着排时没有。两套都收：start/end 按轴翻译。原有拼写一个字没动。
+# ALIGN has two vocabularies, and callers should not have to remember which layer they
+# are talking to. panels.py says start/center/end; here we speak per axis, left/right or
+# top/bottom, because "left" is meaningful when stacking vertically and meaningless when
+# laying out horizontally. Both are accepted: start/end are translated per axis.
+# Existing spellings untouched.
 #
-# 写错时列出的是**这条轴上**可用的词。不分轴地把四个都列出来，等于把
-# "你用错轴了"这条信息扔掉。
+# On a typo, list the words valid **on this axis**. Listing all four regardless of axis
+# would throw away the information "you used the wrong axis".
 _ALIGN_ALIAS = {"y": {"start": "left", "end": "right"},
                 "x": {"start": "top", "end": "bottom"}}
 
@@ -179,7 +197,7 @@ def _pick(align, table, axis):
     key = _ALIGN_ALIAS[axis].get(align, align)
     if key not in table:
         raise ValueError(
-            "align %r 不认识。沿这条轴可用：%s（也收 panels 那套 start/center/end）"
+            "align %r not recognised. Valid along this axis: %s (panels' start/center/end also accepted)"
             % (align, " / ".join(sorted(table))))
     return table[key]
 
@@ -188,14 +206,14 @@ _AT_DEG = {"right": 0.0, "below": 90.0, "left": 180.0, "above": 270.0}
 
 
 def _one_ring(part, i):
-    """部件里第 i 个环，找不到就把量到了什么一起说出来。"""
+    """Ring i of the part; if not found, say what was measured."""
     rr = part.rings()
     if len(rr) <= i:
         raise ValueError(
-            "部件 %r 没有第 %d 个环：量到 %d 个（半径 %s）。只有 cycle 部件有环，"
-            "而且弧得还在——join / drop 把弧丢掉了就量不到。"
+            "part %r has no ring %d: measured %d (radius %s). Only cycle parts have rings, "
+            "and the arcs must still be there - if join / drop discarded the arcs they cannot be measured."
             % (part.name, i, len(rr),
-               ", ".join("%.1f" % x["r"] for x in rr) or "无"))
+               ", ".join("%.1f" % x["r"] for x in rr) or "none"))
     return rr[i]
 
 
@@ -203,7 +221,7 @@ class Part:
     def __init__(self, name, doc, report):
         self.name, self.doc, self.report = name, doc, report
         self.dx = self.dy = 0.0
-        self.drop = set()          # 要整段删掉的顶层对象下标
+        self.drop = set()          # indices of top-level objects to delete whole
 
     def kept(self):
         return [o for i, o in enumerate(self.doc.objs) if i not in self.drop]
@@ -214,16 +232,20 @@ class Part:
                 max(b[2] for b in bs) + self.dx, max(b[3] for b in bs) + self.dy]
 
     def rings(self):
-        """这个部件里每个环的圆：[{"c": (cx, cy), "r": R, "arcs": n}]，带上 dx/dy。
+        """The circle of each ring in this part: [{"c": (cx, cy), "r": R, "arcs": n}],
+        with dx/dy applied.
 
-        取自**画出来的墨**，不是引擎承诺的坐标：环弧是 ChemDraw 的 <arrow>，圆心
-        和半径就写在 Center3D / MajorAxisEnd3D 上（引擎自己也是拿这两个数画的）。
-        报告里的 centre 是引擎布局空间的，跟成品 CDXML 差一个 finalize 的平移，
-        而组合器摆位要的是后者。
+        Taken from the **ink actually drawn**, not the coordinates the engine promised:
+        ring arcs are ChemDraw <arrow>s, and the centre and radius are written in
+        Center3D / MajorAxisEnd3D (the engine itself draws from these two numbers). The
+        centre in the report is in the engine's layout space, off from the finished
+        CDXML by finalize's translation, and the composer's placement needs the latter.
 
-        半径不猜：报告 rings[*].radius（单环图是 ring.radius）已经解出了 R，这里
-        只认半径对得上那个数的弧组。喂料弧、挂件的弯箭头半径是 11~26，环是 95 起，
-        本来就分得开；但"分得开"是这一份语料的巧合，"等于引擎解出的那个数"不是。
+        The radius is not guessed: the report's rings[*].radius (ring.radius for a
+        single-ring figure) already solved R; here only arc groups whose radius matches
+        that number count. Feed arcs and pendant curved arrows have radii 11~26, rings
+        start at 95, so they separate anyway; but "they separate" is a coincidence of
+        this corpus, "equals the number the engine solved" is not.
         """
         want = []
         rep = self.report or {}
@@ -248,8 +270,9 @@ class Part:
                 continue
             k = (round(cx, 1), round(cy, 1), round(r, 1))
             groups[k] = groups.get(k, 0) + 1
-        # 一个环至少两段弧（一条边一段）。两根各自画的箭头不会把圆心撞到 0.1 单位
-        # 以内，所以这一条同时挡掉了半径碰巧等于 R 的单根弧。
+        # A ring has at least two arcs (one per edge). Two independently drawn arrows
+        # will not have centres within 0.1 unit of each other, so this also blocks a
+        # lone arc whose radius happens to equal R.
         out = [{"c": (cx + self.dx, cy + self.dy), "r": r, "arcs": n}
                for (cx, cy, r), n in groups.items() if n >= 2]
         out.sort(key=lambda d: (-d["r"], d["c"]))
@@ -261,7 +284,7 @@ class Part:
                          if i not in self.drop)
 
 
-# ---------------------------------------------------------------- 组合器
+# ---------------------------------------------------------------- composer
 
 class Composer:
     def __init__(self, margin: float = 30.0, workdir: str | None = None):
@@ -271,48 +294,55 @@ class Composer:
             os.path.dirname(os.path.abspath(__file__)), "parts")
         self.notes: list[str] = []
         self.conflicts: list[dict] = []
-        self.links: list[dict] = []    # 跨部件的箭头，见 arrow()
-        # 跨部件的家具：通栏标题条、框住一组部件的外框、分区底色、段间横线。
-        # 它们的锚点是**几个部件的并集**，那个数只有这一层知道——引擎那边
-        # `of: "figure"` 里的 figure 是它自己那一次调用画出来的墨，不是整张图。
+        self.links: list[dict] = []    # cross-part arrows, see arrow()
+        # Cross-part furniture: full-width title bars, frames around a group of parts,
+        # section backgrounds, rules between sections. Their anchor is **the union of
+        # several parts**, a number only this layer knows - on the engine side the
+        # figure in `of: "figure"` is the ink of that one call, not the whole figure.
         self.furniture: list[dict] = []
 
-    # -- 跑引擎 -------------------------------------------------------------
-    # 名字是这一层唯一的地址。摆位、`of`、`span`、join、arrow —— 每一个都只收名
-    # 字，而按名字找**只找得到第一个**。所以两个东西同名不是"后一个覆盖前一个"，
-    # 是后一个从此**再也指不到**：#054 里三只灯泡和三个供体都叫 b1/b2/b3，摆位全
-    # 落在灯泡上，三个供体留在原点，write() 一声不吭。
+    # -- run engines --------------------------------------------------------
+    # The name is this layer's only address. Placement, `of`, `span`, join, arrow - each
+    # accepts only a name, and lookup by name **finds only the first**. So two things
+    # with one name is not "the later overrides the earlier", it is the later one **can
+    # never be addressed again**: in #054 three bulbs and three donors were all called
+    # b1/b2/b3, every placement landed on the bulbs, the three donors stayed at the
+    # origin, and write() said nothing.
     #
-    # 拒掉而不是报一句，因为没有可退的正确行为：挑第一个是随意的，挑最后一个一样
-    # 随意，而调用者要的那个，两种挑法都可能不是。改名是一秒钟的事。
+    # Reject rather than note, because there is no correct fallback: picking the first
+    # is arbitrary, picking the last just as arbitrary, and the one the caller wanted
+    # may be neither. Renaming takes a second.
     #
-    # 部件和家具共用这一个命名空间——`of=` 两边都收，`_union` 先查家具再查部件，
-    # 所以一件家具叫了部件的名字就把那个部件**遮掉**了。一条规则管两边。
+    # Parts and furniture share this one namespace - `of=` accepts both, `_union` checks
+    # furniture first then parts, so a piece of furniture named after a part **hides**
+    # that part. One rule covers both.
     def _claim(self, name, what):
-        """占下一个名字，占过了就拒。`what` 只用来把错误说清楚。"""
+        """Claim a name; reject if already claimed. `what` is only used to make the
+        error clear."""
         name = str(name)
         parts = [p.name for p in self.parts]
         furn = [f["name"] for f in self.furniture]
-        held = "部件" if name in parts else ("家具" if name in furn else None)
+        held = "part" if name in parts else ("furniture" if name in furn else None)
         if held:
             raise ValueError(
-                "名字 %r 已经被一个%s占了，不能再给%s —— 这一层按名字找东西只找得到"
-                "第一个，后一个会摆不动。现有：部件 %s；家具 %s"
-                % (name, held, what, ", ".join(parts) or "无", ", ".join(furn) or "无"))
+                "name %r is already taken by a %s, cannot also give it to %s - this layer finds things by name and only finds"
+                " the first; the later one could not be placed. Existing: parts %s; furniture %s"
+                % (name, held, what, ", ".join(parts) or "none", ", ".join(furn) or "none"))
         return name
 
     def _run(self, tool, name, kw):
         import chemwand_mcp as M
         import json
-        # 先占名字再调引擎：重名的话画出来也是白画，而且报错要早于那一趟布局。
-        name = self._claim(name, "部件")
+        # Claim the name before calling the engine: with a duplicate name the drawing is
+        # wasted, and the error should come before that layout run.
+        name = self._claim(name, "part")
         fn = getattr(M, tool)
         with M.headless(self.workdir):
             rep = fn(filename="_part_" + name, **kw)
         rep = json.loads(rep) if isinstance(rep, str) else rep
         path = rep.get("path")
         if not path or not os.path.exists(path):
-            raise RuntimeError("%s(%s) 没写出文件：%s" % (tool, name, str(rep)[:400]))
+            raise RuntimeError("%s(%s) wrote no file: %s" % (tool, name, str(rep)[:400]))
         p = Part(name, CD.Doc(open(path).read(), name), rep)
         self.parts.append(p)
         return p
@@ -342,13 +372,14 @@ class Composer:
         for p in self.parts:
             if p.name == name:
                 return p
-        raise KeyError("没有名为 %r 的部件（有 %s）"
+        raise KeyError("no part named %r (have %s)"
                        % (name, ", ".join(p.name for p in self.parts)))
 
-    # -- 摆位：按墨的实际范围 ------------------------------------------------
+    # -- placement: by the actual extent of the ink -------------------------
     def _stack(self, who, ref, gap, axis, sign, align):
-        """ref 可以是一个名字，也可以是一串名字 —— 一串的话按它们的**并集**摆。
-        顶栏要压在两个环上面，只挑其中一个当参照会歪。"""
+        """ref can be one name or a list of names - for a list, place against their
+        **union**. A top bar has to sit above two rings; picking just one of them as
+        reference skews it."""
         a = self[who]
         names = [ref] if isinstance(ref, str) else list(ref)
         boxes = [self[n].ink_bbox() for n in names]
@@ -386,33 +417,41 @@ class Composer:
         p.dy += dy
         return p
 
-    # -- 摆位：按圆，不按外框 ------------------------------------------------
+    # -- placement: by circle, not by bounding box --------------------------
     #
-    # 为什么单开一条路，而不是给 below / right_of 调一个 gap：那几个按**墨的外框**
-    # 摆，而一个环部件的外框是"环 + 挂在环上的每个分子和每个标号"。外框刚好贴上的
-    # 时候，两个圆还隔着挂件伸出去的那一截。量过已经画好的 17 张多环图：**一张都没
-    # 相切**，最紧的 050 差 0.3 根键长，016 差 2.2 根（31.7 单位）。引擎那边的默认
-    # 摆法是同一个毛病（layout_cycle 的 `_x += 2*(R+reach_max) + center_gap`），
-    # 连单字母节点的两个环都会被推开 37 单位。
+    # Why a separate path rather than a gap for below / right_of: those place by the
+    # **ink bounding box**, and a ring part's bounding box is "ring + every molecule and
+    # every label hung on it". When the boxes just touch, the two circles are still
+    # apart by however far the pendants stick out. Measured the 17 multi-ring figures
+    # already drawn: **not one is tangent**; the tightest, 050, is off by 0.3 bond
+    # lengths, 016 by 2.2 (31.7 units). The engine's default placement has the same flaw
+    # (layout_cycle's `_x += 2*(R+reach_max) + center_gap`), so even two rings with
+    # single-letter nodes get pushed 37 units apart.
     #
-    # 而语料里这 17 张的原图，14 张是**相切**的，切点上正压着 SET / PT / HAT 徽章
-    # —— 切点就是电子转移画在哪儿。所以相切不是外观偏好，是化学逻辑的位置。
+    # And of the originals of these 17 figures in the corpus, 14 are **tangent**, with
+    # an SET / PT / HAT badge sitting right on the tangent point - the tangent point is
+    # where the electron transfer is drawn. So tangency is not a look preference, it is
+    # the position of the chemical logic.
     #
-    # 相切没有阈值可调：两圆心距 == R1 + R2，一个等式。`gap` 留着不是为了微调，是
-    # 为了让原图本来就相交的那两张（118 / 120，小 Ir 环穿过大 Cu 环，共用的那步电
-    # 子转移就在透镜里）能写成负数。
+    # Tangency has no threshold to tune: centre distance == R1 + R2, one equation. `gap`
+    # is kept not for fine-tuning but so the two originals that already intersect (118 /
+    # 120, a small Ir ring passing through a large Cu ring, with the shared electron
+    # transfer step inside the lens) can be written as a negative number.
     def tangent(self, who, ref, at="right", gap=0.0, ring=0, ref_ring=0):
-        """把 who 挪到跟 ref 正好相切。返回 (切点, 实测缺口)。
+        """Move who so it is exactly tangent to ref. Returns (tangent point, measured
+        gap).
 
-        at  who 的圆心落在 ref 圆心的哪个方向。给度数（CDXML 的 y 朝下，所以
-            0=右、90=下、180=左、270=上），或者给 right / below / left / above。
-        gap 两圆之间额外的距离。0 = 真相切；负 = 故意相交。
+        at  direction of who's centre from ref's centre. Give degrees (CDXML y points
+            down, so 0=right, 90=below, 180=left, 270=above), or right / below / left /
+            above.
+        gap extra distance between the two circles. 0 = truly tangent; negative =
+            deliberately intersecting.
         """
         a, b = self[who], self[ref]
         ca, cb = _one_ring(a, ring), _one_ring(b, ref_ring)
         if isinstance(at, str):
             if at not in _AT_DEG:
-                raise ValueError("at %r 不认识，可用 %s，或者直接给度数"
+                raise ValueError("at %r not recognised; use %s, or give degrees directly"
                                  % (at, " / ".join(_AT_DEG)))
             deg = _AT_DEG[at]
         else:
@@ -421,45 +460,47 @@ class Composer:
         d = ca["r"] + cb["r"] + gap
         a.dx += cb["c"][0] + d * math.cos(th) - ca["c"][0]
         a.dy += cb["c"][1] + d * math.sin(th) - ca["c"][1]
-        # 切点：从 ref 的圆心往那个方向走 ref 自己的半径。gap=0 时它同时在两个圆上，
-        # 徽章就该压在这儿。
+        # Tangent point: from ref's centre walk ref's own radius in that direction. With
+        # gap=0 it lies on both circles, and that is where the badge belongs.
         pt = (cb["c"][0] + cb["r"] * math.cos(th),
               cb["c"][1] + cb["r"] * math.sin(th))
         got = self.ring_gap(who, ref, ring=ring, ref_ring=ref_ring)
-        self.notes.append("%s 相切于 %s：方向 %.0f°，切点 (%.1f, %.1f)，"
-                          "实测缺口 %+.2f" % (who, ref, deg, pt[0], pt[1], got))
+        self.notes.append("%s tangent to %s: direction %.0f°, tangent point (%.1f, %.1f), "
+                          "measured gap %+.2f" % (who, ref, deg, pt[0], pt[1], got))
         return pt, got
 
     def ring_gap(self, who, ref, ring=0, ref_ring=0):
-        """两个部件的环之间量出来的缺口：圆心距 - (R1+R2)。
+        """Measured gap between the rings of two parts: centre distance - (R1+R2).
 
-        0 = 相切，正 = 散开，负 = 相交。摆完位拿它复核——相切必须是一条能跑的
-        检查，不是"我调过了"。
+        0 = tangent, positive = apart, negative = intersecting. Use it to re-check after
+        placement - tangency must be a check that runs, not "I tuned it".
         """
         ca, cb = _one_ring(self[who], ring), _one_ring(self[ref], ref_ring)
         d = math.hypot(ca["c"][0] - cb["c"][0], ca["c"][1] - cb["c"][1])
         return d - (ca["r"] + cb["r"])
 
 
-    # -- 摆位：共享锚点 ------------------------------------------------------
+    # -- placement: shared anchors -------------------------------------------
     def anchor_of(self, part, key, by):
-        """(锚点坐标, [要丢掉的对象]) —— by='species' 用结构框中心，by='label' 用标签框中心。"""
+        """(anchor coordinates, [objects to drop]) - by='species' uses the structure box centre, by='label' the label box centre."""
         p = self[part]
         if by == "label":
             lab = p.doc.label(key)
             return ((lab.bbox[0] + lab.bbox[2]) / 2, (lab.bbox[1] + lab.bbox[3]) / 2), [lab]
         f, lab = p.doc.species(key)
         if f is None:
-            raise ValueError("%s: 标签 %r 底下找不到结构（text-only 的物种请用 by='label'）"
+            raise ValueError("%s: no structure found under label %r (for text-only species use by='label')"
                              % (part, key))
         return ((f.bbox[0] + f.bbox[2]) / 2, (f.bbox[1] + f.bbox[3]) / 2), [f, lab]
 
     def residual(self, who, to, at, my=None, by="species", by_to=None):
-        """两边都认这个物种时，它们各自落点还差多少。
+        """When both sides know this species, how far apart their positions still are.
 
-        两个引擎各自排完版，同一个物种在两份产出里的相对位置是各自定的。锚定一处
-        就把另一处的差额固定下来了——这个差额没人能同时消掉，它是**两个引擎的
-        约束冲突本身**，不是 bug。组合器能做的是把它量出来报给人看。
+        Each engine lays out on its own, so a species' relative position in the two
+        outputs is set independently. Anchoring one fixes the difference at the other -
+        nobody can cancel both at once; it is **the constraint conflict between the two
+        engines itself**, not a bug. What the composer can do is measure it and report
+        it.
         """
         a, b = self[who], self[to]
         ca, _ = self.anchor_of(who, my or at, by)
@@ -468,11 +509,13 @@ class Composer:
                 round(cb[1] + b.dy - (ca[1] + a.dy), 1))
 
     def residual_shapes(self, who, to, drop=False):
-        """两个部件已经摆好之后，列出所有共有结构还差多少（不移动任何东西）。
+        """After two parts are placed, list how far apart every shared structure still
+        is (moves nothing).
 
-        `#098` 那种：两个环共用一个**节点**（文字），又共用一个**物种**（结构）。
-        锚点只能挑一个，另一个的差额得报出来。drop=True 时顺手把 who 里重复的
-        结构删掉——不管对不对得上，同一个分子画两遍总是错的。
+        The `#098` kind: two rings share one **node** (text) and also one **species**
+        (structure). Only one can be the anchor; the other's difference has to be
+        reported. With drop=True also delete the duplicate structures in who - matched
+        or not, drawing one molecule twice is always wrong.
         """
         a, b = self[who], self[to]
         sa, sb = a.doc.shapes(), b.doc.shapes()
@@ -484,7 +527,7 @@ class Composer:
                  round(sb[k][0].bbox[1] + b.dy - sa[k][0].bbox[1] - a.dy, 1))
             out.append(r)
             self.conflicts.append({"part": who, "vs": to, "key": "shape", "gap": list(r)})
-            self.notes.append("  ⚠ %s/%s 还共用一个结构，差 (%.1f, %.1f)" % (who, to, r[0], r[1]))
+            self.notes.append("  ⚠ %s/%s also share a structure, off by (%.1f, %.1f)" % (who, to, r[0], r[1]))
             if drop:
                 f = sa[k][0]
                 lab = a.doc.label_of(f)
@@ -494,36 +537,39 @@ class Composer:
         return out
 
     def join_shape(self, who, to, on=0, drop=True):
-        """把 who 和 to 里**画的是同一个分子**的结构对上，不靠标签。
+        """Align the structures in who and to that **draw the same molecule**, without
+        relying on labels.
 
-        找出两边共有的全部物种，用第 `on` 个对齐，其余的把残差量出来报给人看——
-        一条两端都接在环上的链（#026 的 imidoyl→…→adduct）必然有一头对不上，
-        那是两个引擎各自排完版之后的约束冲突，不是可以选一个"对"的答案。
-        drop=True 时 who 里那些重复的结构整段删掉，共享的物种只画一次。
+        Find all species the two share, align on the `on`-th one, and measure and report
+        the residuals of the rest - a chain attached to rings at both ends (#026's
+        imidoyl->...->adduct) necessarily has one end that does not match; that is the
+        constraint conflict after each engine laid out on its own, not something with a
+        "right" answer to pick. With drop=True the duplicate structures in who are
+        deleted whole, so shared species are drawn only once.
         """
         a, b = self[who], self[to]
         sa, sb = a.doc.shapes(), b.doc.shapes()
         common = [k for k in sa if k in sb and len(sa[k]) == 1 and len(sb[k]) == 1]
         if not common:
-            raise ValueError("%s 和 %s 没有画同一个分子" % (who, to))
-        common.sort(key=lambda k: sa[k][0].bbox[1])       # 从上到下，好指认
+            raise ValueError("%s and %s do not draw the same molecule" % (who, to))
+        common.sort(key=lambda k: sa[k][0].bbox[1])       # top to bottom, easy to point at
         pick = common[on]
         fa, fb = sa[pick][0], sb[pick][0]
         a.dx += (fb.bbox[0] + fb.bbox[2]) / 2 + b.dx - (fa.bbox[0] + fa.bbox[2]) / 2
         a.dy += (fb.bbox[1] + fb.bbox[3]) / 2 + b.dy - (fa.bbox[1] + fa.bbox[3]) / 2
-        self.notes.append("%s 按共有结构对齐到 %s（共有 %d 个，用第 %d 个）"
+        self.notes.append("%s aligned to %s by shared structure (%d shared, used #%d)"
                           % (who, to, len(common), on))
         for i, k in enumerate(common):
             if i != on:
                 r = (round(sb[k][0].bbox[0] + b.dx - sa[k][0].bbox[0] - a.dx, 1),
                      round(sb[k][0].bbox[1] + b.dy - sa[k][0].bbox[1] - a.dy, 1))
-                self.notes.append("  ⚠ 第 %d 个共有结构对不上：差 (%.1f, %.1f)" % (i, r[0], r[1]))
+                self.notes.append("  ⚠ shared structure #%d does not match: off by (%.1f, %.1f)" % (i, r[0], r[1]))
                 self.conflicts.append({"part": who, "vs": to, "key": "shape#%d" % i,
                                        "gap": list(r)})
         if drop:
             for k in common:
                 f = sa[k][0]
-                lab = a.doc.label_of(f)        # 标签必须一起丢，否则编号留在原地
+                lab = a.doc.label_of(f)        # the label must go too, or the number stays behind
                 for i, o in enumerate(a.doc.objs):
                     if o is f or (lab is not None and o is lab):
                         a.drop.add(i)
@@ -531,12 +577,15 @@ class Composer:
 
     def join(self, who, to, at, my=None, drop=True, by="species",
              by_to=None, also=None):
-        """把 who 里叫 `my`（默认同名 `at`）的物种，对齐到 to 里叫 `at` 的物种上。
+        """Align the species called `my` (default: same name as `at`) in who onto the
+        species called `at` in to.
 
-        对齐的是**结构的 bbox 中心**，不是标签的位置——两个引擎给标签的行高和
-        对齐方式不一定一样，结构本身才是两边都认得的同一个东西。
-        drop=True 时把 who 里那一份重复的结构和标签整段删掉，于是这个物种在
-        成品里只画一次，跨引擎的箭头也就不用画了。
+        What is aligned is the **structure's bbox centre**, not the label position - the
+        two engines do not necessarily give labels the same line height and
+        justification; the structure itself is what both sides recognise as the same
+        thing. With drop=True the duplicate structure and label in who are deleted
+        whole, so this species is drawn only once in the finished figure, and no
+        cross-engine arrow is needed.
         """
         a, b = self[who], self[to]
         my = my or at
@@ -544,33 +593,34 @@ class Composer:
         cb, theirs = self.anchor_of(to, at, by_to or by)
         a.dx += cb[0] - ca[0] + b.dx
         a.dy += cb[1] - ca[1] + b.dy
-        self.notes.append("锚定 %s.%s → %s.%s，位移 (%.1f, %.1f)"
+        self.notes.append("anchored %s.%s → %s.%s, offset (%.1f, %.1f)"
                           % (who, my, to, at, a.dx, a.dy))
         if drop:
             for i, o in enumerate(a.doc.objs):
                 if o in mine:
                     a.drop.add(i)
-            self.notes.append("  丢掉 %s 里重复的 %r，只保留 %s 那一份" % (who, my, to))
+            self.notes.append("  in %s, dropped the duplicate %r, keeping only the one in %s" % (who, my, to))
         if also:
             k, kb = (also, also) if isinstance(also, str) else also
             r = self.residual(who, to, kb, my=k, by=by, by_to=by_to)
-            self.notes.append("  ⚠ 第二个锚点 %r 对不上：差 (%.1f, %.1f)。"
-                              "两个引擎各自排完版，这个差没人能同时消掉" % (k, r[0], r[1]))
+            self.notes.append("  ⚠ second anchor %r does not match: off by (%.1f, %.1f). "
+                              "Each engine laid out on its own; nobody can cancel this difference at the same time" % (k, r[0], r[1]))
             self.conflicts.append({"part": who, "vs": to, "key": k, "gap": list(r)})
         return a
 
     def arrow_between(self, part, a, b):
-        """part 里连接物种 a 和 b 的那根箭头。
+        """The arrow in part connecting species a and b.
 
-        找法是几何的：横跨在两个结构之间、竖直方向与它们重叠的那根。不走引擎的
-        `placement` 出参，因为 linear 的 placement 只报箭头的 tail/head，**一个物种的
-        几何都没有**（layout_linear.py:1000-1030），对不上名字。
+        Found geometrically: the one spanning between the two structures and overlapping
+        them vertically. Does not use the engine's `placement` output, because linear's
+        placement reports only the arrow tail/head, **no geometry for any species**
+        (layout_linear.py:1000-1030), so names cannot be matched.
         """
         p = self[part]
         fa, _ = p.doc.species(a)
         fb, _ = p.doc.species(b)
         if fa is None or fb is None:
-            raise ValueError("%s: %r 或 %r 找不到结构" % (part, a, b))
+            raise ValueError("%s: no structure found for %r or %r" % (part, a, b))
         lo, hi = sorted((fa.bbox[2], fb.bbox[0])) if fa.bbox[2] <= fb.bbox[0] \
             else sorted((fb.bbox[2], fa.bbox[0]))
         ymid = (fa.bbox[1] + fa.bbox[3] + fb.bbox[1] + fb.bbox[3]) / 4
@@ -578,15 +628,16 @@ class Composer:
                 and lo - 4 <= (o.ink_bbox()[0] + o.ink_bbox()[2]) / 2 <= hi + 4
                 and o.ink_bbox()[1] - 30 <= ymid <= o.ink_bbox()[3] + 30]
         if len(hits) != 1:
-            raise ValueError("%s: %r→%r 之间找到 %d 根箭头" % (part, a, b, len(hits)))
+            raise ValueError("%s: %r→%r: found %d arrows between them" % (part, a, b, len(hits)))
         return hits[0]
 
     def under_arrow(self, who, ref, a, b, gap=0.0, align="center"):
-        """把 who 整块摆到 ref 里 a→b 那根箭头的下面，横向对中。
+        """Place the whole of who under the a→b arrow in ref, centred horizontally.
 
-        这是**没有共享物种**时的摆法：催化剂循环和主链一个分子都不共用，
-        它们之间只有"这个循环解释的是这一步"这层关系，而那是几何关系。
-        gap 可以为负——原图里环的上弧就是顶到箭头上的。
+        This is the placement when there is **no shared species**: a catalytic cycle and
+        the main chain share not one molecule; the only relation between them is "this
+        cycle explains this step", and that is a geometric relation. gap can be negative
+        - in the original the ring's top arc touches the arrow.
         """
         w, r = self[who], self[ref]
         ar = self.arrow_between(ref, a, b)
@@ -595,67 +646,75 @@ class Composer:
         cx = (ab[0] + ab[2]) / 2 + r.dx
         w.dx += cx - (wb[0] + wb[2]) / 2 if align == "center" else 0.0
         w.dy += (ab[3] + r.dy + gap) - wb[1]
-        self.notes.append("%s 摆在 %s 的 %s→%s 箭头下方（间距 %.0f）" % (who, ref, a, b, gap))
+        self.notes.append("%s placed below %s's %s→%s arrow (gap %.0f)" % (who, ref, a, b, gap))
         return w
 
-    # -- 跨部件的箭头：父层唯一能画的那一根 -----------------------------------
+    # -- cross-part arrows: the one arrow only the parent layer can draw ------
 
     def arrow(self, frm, to, *, bulge=0.0, gap=10.0, head="Full", tail=None,
               color=None, line=None):
-        """一头在这一块、另一头在那一块的箭头。
+        """An arrow with one end in this block and the other in that one.
 
-        引擎画不了它，而且这不是遗漏：每个引擎只知道**自己**排了什么，两端分属
-        两次调用的那根箭头，两个端点的位置只有摆完位的父层同时知道。#173 的原图
-        就是这个形状 —— `•CCl₃` 从循环里出来，直接接到主链 8-3→8-4 那一步上；
-        今天只能在环里和链里各画一份，读者得自己认出那是同一个物种。
+        Engines cannot draw it, and this is no omission: each engine knows only what
+        **it** laid out; for an arrow whose ends belong to two calls, only the parent
+        layer, after placement, knows both endpoints. #173's original has exactly this
+        shape - `•CCl₃` comes out of the cycle and goes straight to the 8-3→8-4 step of
+        the main chain; today it can only be drawn once in the ring and once in the
+        chain, and the reader has to recognise it is the same species.
 
-        端点写成 (部件名, 指认)：
-          "8-3"            那个标签指认的结构
-          ("8-2", "8-3")   这两个结构之间的那根箭头（reagent 落在一步上就是这个）
+        Endpoints are written as (part name, designator):
+          "8-3"            the structure that label designates
+          ("8-2", "8-3")   the arrow between these two structures (a reagent landing
+                           on a step is this)
 
-        解析推迟到 build()：摆位还可能变（under_arrow、nudge 都在后面），
-        端点得按**最终**位置算，而不是声明那一刻的。
+        Resolution is deferred to build(): placement may still change (under_arrow,
+        nudge both come later), so endpoints must be computed from the **final**
+        positions, not those at declaration time.
         """
         self.links.append(dict(frm=frm, to=to, bulge=float(bulge), gap=float(gap),
                                head=head, tail=tail, color=color, line=line))
         return self
 
     def _link_box(self, ref):
-        """(部件名, 指认) -> 这一块在拼合坐标里的墨框。"""
+        """(part name, designator) -> this block's ink box in composed coordinates."""
         name, what = ref
         p = self[name]
         if isinstance(what, (tuple, list)):
             o = self.arrow_between(name, *what)
         else:
-            # species() 返回 (结构, 标签)。**写成文字的物种结构是 None** —— 环上
-            # 的 `•CCl₃ + Br⁻` 就是这样，它只有一个 <t>。那也是一个合法的端点：
-            # 一根箭头指向"写出来的那个物种"和指向画出来的没有区别。
+            # species() returns (structure, label). **For a species written as text the
+            # structure is None** - the ring's `•CCl₃ + Br⁻` is like that; it has only a
+            # <t>. That is a legal endpoint too: an arrow pointing at "the species
+            # written out" is no different from pointing at a drawn one.
             frag, lab = p.doc.species(str(what))
             o = frag or lab
         if o is None:
-            raise ValueError("%s 里找不到 %r" % (name, what))
+            raise ValueError("%s: %r not found" % (name, what))
         b = o.ink_bbox() or o.bbox
         return [b[0] + p.dx, b[1] + p.dy, b[2] + p.dx, b[3] + p.dy]
 
     @staticmethod
     def _edge(box, toward, gap):
-        """从 box 的中心朝 toward 走，落在框边上再退开 gap。
+        """Walk from box's centre toward toward, land on the box edge, then back off by
+        gap.
 
-        端点取边而不是中心：箭头从结构中心长出来会压在它自己的键上。
+        Endpoints take the edge, not the centre: an arrow growing out of a structure's
+        centre would sit on its own bonds.
         """
         cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
         dx, dy = toward[0] - cx, toward[1] - cy
         n = math.hypot(dx, dy) or 1.0
         hw, hh = (box[2] - box[0]) / 2, (box[3] - box[1]) / 2
-        # 缩放到矩形边界：取两个方向上先撞到的那一个
+        # scale to the rectangle edge: take whichever direction hits first
         t = min(hw / abs(dx) if dx else 1e18, hh / abs(dy) if dy else 1e18)
         return (cx + dx * t + dx / n * gap, cy + dy * t + dy / n * gap)
 
     def _build_links(self, aid0=4_900_000):
-        """把声明过的跨部件箭头解析成 (xml, 折线)。在 build() 里调用。
+        """Resolve the declared cross-part arrows into (xml, polyline). Called in
+        build().
 
-        号段 4.9M：在任何单个部件用得到的号之上（最大是 _add_graphics 的
-        970000+si*20000），又在第 1 个部件的偏移 5M 之下。
+        Id range 4.9M: above any id a single part uses (the largest is _add_graphics's
+        970000+si*20000), and below part 1's offset of 5M.
         """
         out = []
         for i, lk in enumerate(self.links):
@@ -684,64 +743,72 @@ class Composer:
             out.append((xml, pts))
         return out
 
-    # -- 跨部件的箭头：父层唯一能画的那一根 -----------------------------------
+    # -- cross-part arrows: the one arrow only the parent layer can draw ------
 
     def arrow(self, frm, to, *, bulge=0.0, gap=10.0, head="Full", tail=None,
               color=None, line=None):
-        """一头在这一块、另一头在那一块的箭头。
+        """An arrow with one end in this block and the other in that one.
 
-        引擎画不了它，而且这不是遗漏：每个引擎只知道**自己**排了什么，两端分属
-        两次调用的那根箭头，两个端点的位置只有摆完位的父层同时知道。#173 的原图
-        就是这个形状 —— `•CCl₃` 从循环里出来，直接接到主链 8-3→8-4 那一步上；
-        今天只能在环里和链里各画一份，读者得自己认出那是同一个物种。
+        Engines cannot draw it, and this is no omission: each engine knows only what
+        **it** laid out; for an arrow whose ends belong to two calls, only the parent
+        layer, after placement, knows both endpoints. #173's original has exactly this
+        shape - `•CCl₃` comes out of the cycle and goes straight to the 8-3→8-4 step of
+        the main chain; today it can only be drawn once in the ring and once in the
+        chain, and the reader has to recognise it is the same species.
 
-        端点写成 (部件名, 指认)：
-          "8-3"            那个标签指认的结构
-          ("8-2", "8-3")   这两个结构之间的那根箭头（reagent 落在一步上就是这个）
+        Endpoints are written as (part name, designator):
+          "8-3"            the structure that label designates
+          ("8-2", "8-3")   the arrow between these two structures (a reagent landing
+                           on a step is this)
 
-        解析推迟到 build()：摆位还可能变（under_arrow、nudge 都在后面），
-        端点得按**最终**位置算，而不是声明那一刻的。
+        Resolution is deferred to build(): placement may still change (under_arrow,
+        nudge both come later), so endpoints must be computed from the **final**
+        positions, not those at declaration time.
         """
         self.links.append(dict(frm=frm, to=to, bulge=float(bulge), gap=float(gap),
                                head=head, tail=tail, color=color, line=line))
         return self
 
     def _link_box(self, ref):
-        """(部件名, 指认) -> 这一块在拼合坐标里的墨框。"""
+        """(part name, designator) -> this block's ink box in composed coordinates."""
         name, what = ref
         p = self[name]
         if isinstance(what, (tuple, list)):
             o = self.arrow_between(name, *what)
         else:
-            # species() 返回 (结构, 标签)。**写成文字的物种结构是 None** —— 环上
-            # 的 `•CCl₃ + Br⁻` 就是这样，它只有一个 <t>。那也是一个合法的端点：
-            # 一根箭头指向"写出来的那个物种"和指向画出来的没有区别。
+            # species() returns (structure, label). **For a species written as text the
+            # structure is None** - the ring's `•CCl₃ + Br⁻` is like that; it has only a
+            # <t>. That is a legal endpoint too: an arrow pointing at "the species
+            # written out" is no different from pointing at a drawn one.
             frag, lab = p.doc.species(str(what))
             o = frag or lab
         if o is None:
-            raise ValueError("%s 里找不到 %r" % (name, what))
+            raise ValueError("%s: %r not found" % (name, what))
         b = o.ink_bbox() or o.bbox
         return [b[0] + p.dx, b[1] + p.dy, b[2] + p.dx, b[3] + p.dy]
 
     @staticmethod
     def _edge(box, toward, gap):
-        """从 box 的中心朝 toward 走，落在框边上再退开 gap。
+        """Walk from box's centre toward toward, land on the box edge, then back off by
+        gap.
 
-        端点取边而不是中心：箭头从结构中心长出来会压在它自己的键上。
+        Endpoints take the edge, not the centre: an arrow growing out of a structure's
+        centre would sit on its own bonds.
         """
         cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
         dx, dy = toward[0] - cx, toward[1] - cy
         n = math.hypot(dx, dy) or 1.0
         hw, hh = (box[2] - box[0]) / 2, (box[3] - box[1]) / 2
-        # 缩放到矩形边界：取两个方向上先撞到的那一个
+        # scale to the rectangle edge: take whichever direction hits first
         t = min(hw / abs(dx) if dx else 1e18, hh / abs(dy) if dy else 1e18)
         return (cx + dx * t + dx / n * gap, cy + dy * t + dy / n * gap)
 
     def _build_links(self, aid0=4_900_000):
-        """把声明过的跨部件箭头解析成 (xml, 折线)。在 build() 里调用。
+        """Resolve the declared cross-part arrows into (xml, polyline). Called in
+        build().
 
-        号段 4.9M：在任何单个部件用得到的号之上（最大是 _add_graphics 的
-        970000+si*20000），又在第 1 个部件的偏移 5M 之下。
+        Id range 4.9M: above any id a single part uses (the largest is _add_graphics's
+        970000+si*20000), and below part 1's offset of 5M.
         """
         out = []
         for i, lk in enumerate(self.links):
@@ -770,23 +837,26 @@ class Composer:
             out.append((xml, pts))
         return out
 
-    # -- 碰撞：父层唯一知道两个引擎同时占了哪里的地方 -------------------------
+    # -- collisions: the only place that knows where two engines both took space --
     def collisions(self, tol: float = 1.0, pad: float = 0.0):
-        """pad>0 时把每个物件先胀 pad 再判，用来抓"没重叠但贴太近"。
+        """With pad>0 each object is inflated by pad before testing, to catch "not
+        overlapping but too close".
 
-        重叠和留白是两个问题——allocator 自己也是这么分的（重叠用 depth，
-        留白用 `probe(pad=...)`）。#190 里环的 5CzBN 节点标签离链条的箭头只有
-        12 个单位，一处重叠都没有，但读起来像是链条的一部分。"""
+        Overlap and whitespace are two problems - the allocator splits them the same way
+        (overlap uses depth, whitespace uses `probe(pad=...)`). In #190 the ring's 5CzBN
+        node label was only 12 units from the chain's arrow, no overlap anywhere, yet it
+        read as part of the chain."""
         objs = []
-        # 父层自己画的箭头也得过尺子。它是这张图里唯一不属于任何引擎的墨，
-        # 漏掉它等于在一个"专为查重叠而存在"的图上放一个不查的东西。
-        class _Link:                      # 只为凑齐 tag/text 两个字段
+        # The parent layer's own arrows must go through the ruler too. They are the only
+        # ink in this figure that belongs to no engine; skipping them means putting an
+        # unchecked thing on a figure that "exists specifically to check overlaps".
+        class _Link:                      # only to supply the tag/text fields
             tag = "arrow"
             def __init__(self, i): self.i = i
-            def text(self): return "父层箭头 %d" % self.i
+            def text(self): return "parent arrow %d" % self.i
         for i, (_xml, pts) in enumerate(self._build_links()):
             xs = [q[0] for q in pts]; ys = [q[1] for q in pts]
-            objs.append(("(父层)", _Link(i),
+            objs.append(("(parent)", _Link(i),
                          [min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad],
                          [] if pad else [(pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1])
                                          for k in range(len(pts) - 1)]))
@@ -795,9 +865,10 @@ class Composer:
                 bb = o.ink_bbox()
                 if not bb:
                     continue
-                # 只有空白的 <t> 什么都不画。它们来自 label:" " 那个技巧——
-                # 引擎要求每个物种有标签，不想印就得给一个空格，于是文件里留下
-                # 一个有框但没有墨的对象。拿它判碰撞是纯粹的假阳性。
+                # A <t> that is only whitespace draws nothing. They come from the
+                # label:" " trick - the engine requires every species to have a label,
+                # and to print none you give a space, leaving in the file an object with
+                # a box but no ink. Testing it for collisions is a pure false positive.
                 if o.tag == "t" and not o.text().strip():
                     continue
                 objs.append((p.name, o,
@@ -811,20 +882,20 @@ class Composer:
                 pa, oa, ba, sa = objs[i]
                 pb, ob, bb, sb = objs[j]
                 if pa == pb:
-                    continue                     # 引擎内部的重叠是引擎自己的账
+                    continue                     # overlaps inside one engine are that engine's own business
                 dx, dy = _ovl(ba, bb)
                 if dx <= 0 or dy <= 0:
                     continue
                 if sa and sb:
                     hit = any(_seg_seg(s, t) for s in sa for t in sb)
-                    kind, sev = "线×线", 0.0
+                    kind, sev = "line×line", 0.0
                 elif sa or sb:
                     segs, box = (sa, bb) if sa else (sb, ba)
                     hit = any(_seg_box(s, box) for s in segs)
-                    kind, sev = "线×块", 0.0
+                    kind, sev = "line×block", 0.0
                 else:
                     hit = min(dx, dy) > tol
-                    kind, sev = "块×块", min(dx, dy)
+                    kind, sev = "block×block", min(dx, dy)
                 if hit:
                     out.append({"a": "%s/%s %s" % (pa, oa.tag, oa.text()[:18]),
                                 "b": "%s/%s %s" % (pb, ob.tag, ob.text()[:18]),
@@ -832,17 +903,18 @@ class Composer:
                                 "where": [round(max(ba[0], bb[0])), round(max(ba[1], bb[1]))]})
         return sorted(out, key=lambda r: -r["depth"])
 
-    # -- 谁在上面：画序 + 不透明 ---------------------------------------------
+    # -- who is on top: draw order + opacity ---------------------------------
     #
-    # 实测 11 种 RectangleType（scratchpad/opaque_probe，文字先发、矩形后发）：
-    # 名字里带 Filled 或 Shaded 的把底下的字整个吃掉；Shadow / Shadow Bold /
-    # RoundEdge Shadow 只有边框，肚子是透的，字照样读得出来。圆盘（Orbital 的
-    # OvalType）同一条规则，多边形看 CurveType 的 128 位（1=Closed, 128=Filled）。
+    # Measured 11 RectangleTypes (scratchpad/opaque_probe, text emitted first, rectangle
+    # after): those with Filled or Shaded in the name swallow the text beneath entirely;
+    # Shadow / Shadow Bold / RoundEdge Shadow have only a border, the inside is
+    # transparent and the text still reads. Discs (Orbital's OvalType) follow the same
+    # rule; polygons look at bit 128 of CurveType (1=Closed, 128=Filled).
     _OPAQUE = re.compile(r"Filled|Shaded")
 
     @staticmethod
     def _opaque(o) -> bool:
-        """这个对象会不会把它之前画的东西整个盖掉。"""
+        """Whether this object completely covers what was drawn before it."""
         if Composer._OPAQUE.search(o.a.get("RectangleType")
                                    or o.a.get("OvalType") or ""):
             return True
@@ -853,19 +925,22 @@ class Composer:
                 return False
         return False
 
-    # 一个不透明物件遮住的是它**自己的形状**，不是它的外框。语料里 26 条初判
-    # 有 20 条是团块（多边形），按外框算，团块四角外面的字也被判成"盖住了"——
-    # #090 那个 "a" 就在左上角，离灰团还有一截。
-    _COVER_GRID = 9          # 受害者框上取 9x9=81 个点，分辨率约 1.2%
+    # An opaque object hides **its own shape**, not its bounding box. Of 26 first-pass
+    # hits in the corpus, 20 were blobs (polygons); by bounding box, text outside a
+    # blob's corners was also judged "covered" - #090's "a" sits in the top-left corner,
+    # still some way from the grey blob.
+    _COVER_GRID = 9          # take 9x9=81 points on the victim box, resolution about 1.2%
 
     @staticmethod
     def _region(o):
-        """不透明物件的 (外框, 判"点在里面吗")。None 表示读不出形状。
+        """(bounding box, "is the point inside?" test) of an opaque object. None means the shape cannot be read.
 
-        外框不读 BoundingBox：ChemDraw 的 Orbital / Symbol 把它写成"右边先、
-        高度为零"（cdxml_core 里那段手画文件的注释记着这件事），当成矩形用会
-        得到一个倒着的框，于是那个物件永远判不出重叠——静默漏报。Center3D /
-        MajorAxisEnd3D / MinorAxisEnd3D 是几何量，矩形和圆盘都带。
+        The bounding box does not read BoundingBox: ChemDraw's Orbital / Symbol write it
+        "right side first, zero height" (the comment on hand-drawn files in cdxml_core
+        records this); used as a rectangle it would give an inverted box, so that object
+        could never be judged overlapping - a silent miss. Center3D / MajorAxisEnd3D /
+        MinorAxisEnd3D are geometric quantities, and both rectangles and discs carry
+        them.
         """
         a = o.a
         if o.tag == "curve" and o.ink:
@@ -898,12 +973,14 @@ class Composer:
 
     @classmethod
     def _hidden_fraction(cls, victim, box, inside) -> float:
-        """受害者框里有多大一块落在那个形状内。
+        """How much of the victim box falls inside that shape.
 
-        取样不取外框交集：结构的框大半是白的，团块又不是方的，两头都会算歪。
-        在受害者框上铺格子、逐点问"在不在里面"，对字（框就是一块实心的墨）是
-        准的，对结构仍然偏大——一个分子的框里本来就有空地。宁可偏大：漏报一条
-        看不见的标签，比多报一条要贵。
+        Sample rather than intersect bounding boxes: a structure's box is mostly white,
+        and blobs are not square, so both ends would skew. Lay a grid on the victim box
+        and ask point by point "is it inside": for text (the box is solid ink) this is
+        accurate; for structures it still runs high - a molecule's box has empty space
+        in it anyway. Better high: missing one invisible label costs more than one extra
+        report.
         """
         n = cls._COVER_GRID
         w, h = victim[2] - victim[0], victim[3] - victim[1]
@@ -919,13 +996,16 @@ class Composer:
         return hits / float(n * n)
 
     def _furniture_objs(self):
-        """家具的每个顶层对象 + 它属于哪件家具，在部件的共享坐标系里。
+        """Each top-level object of the furniture + which piece of furniture it belongs
+        to, in the parts' shared coordinates.
 
-        _build_furniture 一件家具只还一个并集框，而一件带 fill 的 text 家具发的是
-        "实心矩形 + 文字"两个对象——按并集算，那块矩形会把它自己的文字判成被盖住。
-        所以这里把 xml 再拆一遍，用的还是读部件那套 top_objects / Obj。
+        _build_furniture returns only one union box per piece of furniture, while a text
+        furniture with fill emits two objects, "solid rectangle + text" - by the union,
+        that rectangle would judge its own text covered. So the xml is split again here,
+        with the same top_objects / Obj used for reading parts.
 
-        色表传空的：这一趟只量几何，颜色索引从 2 还是从 9 开始不影响任何一个坐标。
+        The colour table is passed empty: this pass measures geometry only; whether
+        colour indices start at 2 or 9 changes no coordinate.
         """
         if not self.furniture:
             return []
@@ -936,37 +1016,45 @@ class Composer:
                 out.append((f["name"], CD.Obj(t, x[s:e])))
         return out
 
-    # 默认 0.10，Ge 从 90 个图脚本跑出来的阶梯上挑的：
-    #     >= 1%  38 条/16 张    >= 10%  23 条/11 张    >= 50%  6 条/5 张
-    # 定这个数之前先定的是"跟什么比"——跟受害者自己的面积比（见 hid 那段）。取值
-    # 落在 10% 是因为**验过的最低那一档就在这里**：#090 面板 a/b/d 的标题分别报
-    # 22% / 11% / 10%，三条在真图上全是被灰团从中间啃掉的标题，肉眼一看就不对。
-    # 再往下那一档（1%~7%，14 条，多是装饰球擦到标签边）没有逐条看过真图，所以
-    # 不放进默认值里。要看就显式传 covered(hid=0.01)。
+    # Default 0.10, picked by Ge from a ladder run over 90 figure scripts:
+    #     >= 1%  38 hits/16 figures    >= 10%  23 hits/11 figures    >= 50%  6 hits/5 figures
+    # Before choosing the number, "compared with what" was settled - with the victim's
+    # own area (see the hid section). The value sits at 10% because **the lowest
+    # verified rung is here**: #090 panels a/b/d titles report 22% / 11% / 10%, all
+    # three on the real figure are titles bitten through the middle by a grey blob,
+    # obviously wrong at a glance. The rung below (1%~7%, 14 hits, mostly decorative
+    # spheres grazing a label edge) was not checked one by one on real figures, so it is
+    # not in the default. To see it, pass covered(hid=0.01) explicitly.
     COVERED_HID = 0.10
 
     def covered(self, hid: float | None = None):
-        """谁被**后**画的实心块盖住了，盖掉了它自己的百分之几。
+        """Who is covered by a solid block drawn **later**, and what percentage of
+        itself is covered.
 
-        和 collisions() 是两个问题。collisions() 问"两样东西撞上了吗"，这里问
-        "撞上的那两样，哪个在上面"。图里有一整类重叠是**故意的**——蛋白团块垫在
-        分子底下、底色条垫在文字后面、徽章压在框上——把它们算成碰撞，一张图能报
-        出几十处，真事故就淹在里面了。分它们的不是什么标记，是**画的先后**：先画
-        的那块是背景，后画的那块才是事故。
+        A different question from collisions(). collisions() asks "did two things
+        collide"; this asks
+        "of the two that collided, which is on top". A whole class of overlaps in figures is **deliberate** - protein blobs under
+        molecules, background bars behind text, badges on frames - count them as
+        collisions and one figure can report dozens, drowning the real accidents. What
+        separates them is no marker but **draw order**: the block drawn first is
+        background; the block drawn later is the accident.
 
-        画序在 build() 里是定死的，所以"谁在上面"不用猜：家具（按加入顺序）→ 部件
-        （按声明顺序，各自的 Z 依次往上摞）→ 父层箭头。没家具的图不重盖 Z，那时
-        部件之间照旧按各自的 Z，顺序还是声明顺序。
+        Draw order is fixed in build(), so "who is on top" needs no guessing: furniture
+        (in order added) -> parts
+        (in declaration order, each one's Z stacked on top in turn) -> parent arrows. A figure without furniture does not rewrite Z; then
+        parts keep their own Z as before, and the order is still declaration order.
 
-        `hid` 跟**受害者自己的面积**比，不跟盖它的那块比，也不用绝对 pt：一条
-        400x60 的底色条盖掉一个 30x10 的标签，重叠深度只有 10 pt 听着不多，而那个
-        标签是 100% 没了。collisions() 报 depth 是因为它问的是"扎进去多深"。
+        `hid` is compared with **the victim's own area**, not with the covering block,
+        and not in absolute pt: a 400x60 background bar covering a 30x10 label has an
+        overlap depth of only 10 pt, which sounds small, yet that label is 100% gone.
+        collisions() reports depth because it asks "how deep did it go in".
 
-        只认两种受害者：文字（<t>）和结构（<fragment>）。一根被埋掉的线或箭头这里
-        不报——引擎自己的 _reconcile 在部件内部已经报它，而跨部件的线本来就少。
+        Only two kinds of victim count: text (<t>) and structures (<fragment>). A buried
+        line or arrow is not reported here - the engine's own _reconcile already reports
+        it inside a part, and cross-part lines are rare anyway.
         """
         hid = self.COVERED_HID if hid is None else hid
-        objs = []                       # 严格按画序：(来源, 对象, 框, dx, dy)
+        objs = []                       # strictly in draw order: (source, object, box, dx, dy)
         for src, o in self._furniture_objs():
             bb = o.ink_bbox()
             if bb:
@@ -984,20 +1072,20 @@ class Composer:
                 continue
             box, inside = self._region(ob)
             if inside is None:
-                continue                         # 形状读不出来就不猜
-            if ox or oy:                         # 部件里的物件，属性还在部件坐标系
+                continue                         # if the shape cannot be read, do not guess
+            if ox or oy:                         # an object inside a part: its attributes are still in part coordinates
                 box = [box[0] + ox, box[1] + oy, box[2] + ox, box[3] + oy]
                 inside = (lambda f, a, b: lambda x, y: f(x - a, y - b))(inside, ox, oy)
-            for sa, oa, ba, _ax, _ay in objs[:j]:      # 只看它**之前**画的
+            for sa, oa, ba, _ax, _ay in objs[:j]:      # only look at what was drawn **before** it
                 if sa == sb:
-                    continue                     # 同来源内部的层序是那个引擎的账
+                    continue                     # layer order within one source is that engine's own business
                 if oa.tag not in ("t", "fragment"):
                     continue
                 if oa.tag == "t" and not oa.text().strip():
-                    continue                     # label:" " 那个占位技巧，没有墨
+                    continue                     # the label:" " placeholder trick, no ink
                 dx, dy = _ovl(ba, box)
                 if dx <= 0 or dy <= 0:
-                    continue                     # 外框先粗筛，省掉绝大多数取样
+                    continue                     # coarse bounding-box screen first, saves most of the sampling
                 frac = self._hidden_fraction(ba, box, inside)
                 if frac < hid:
                     continue
@@ -1010,10 +1098,10 @@ class Composer:
                                       round(max(ba[1], box[1]))]})
         return sorted(out, key=lambda r: -r["hid"])
 
-    # -- 出片 ---------------------------------------------------------------
+    # -- output -------------------------------------------------------------
     def build(self):
         if not self.parts:
-            raise ValueError("一个部件都没有")
+            raise ValueError("no parts at all")
         head = self.parts[0].doc.header
         fonts = {re.search(r'id="(\d+)"', f).group(1): f
                  for f in _table(head, "fonttable")}
@@ -1024,20 +1112,24 @@ class Composer:
             body = p.body()
             if k:
                 body = _renumber_extra(CORE.renumber(body, idbase), idbase)
-            # 下一个部件的号段从本部件实际用到的最大 id 之上开始。固定的 STRIDE × k
-            # 假设每个部件都在一段之内；一个已经合并过的文件占了好几段，再合一次时
-            # 下一个部件就落进它的第二段，撞号（3 张合成的再并 1 张，25 个重号）。
-            # 普通部件都在一段之内，算出来仍是 STRIDE × k，输出不变。
+            # The next part's id range starts above the largest id this part actually
+            # uses. A fixed STRIDE × k assumes each part fits in one range; an
+            # already-merged file takes several ranges, and merging it again lands the
+            # next part in its second range, colliding ids (3 merged figures merged with
+            # 1 more: 25 duplicate ids). Ordinary parts fit in one range, so the result
+            # is still STRIDE × k and the output is unchanged.
             top = max((int(i) for i in re.findall(r'\bid="(\d+)"', body)), default=0)
             idbase = max(idbase, (top // ID_STRIDE + 1) * ID_STRIDE)
             if k:
-                # 字体表：按 id 求并，同 id 不同字体要说出来
+                # font table: union by id; same id with a different font must be
+                # reported
                 for f in _table(p.doc.header, "fonttable"):
                     fid = re.search(r'id="(\d+)"', f).group(1)
                     if fid in fonts and fonts[fid] != f:
-                        self.notes.append("字体 id=%s 两个部件定义不同，用了第一个" % fid)
+                        self.notes.append("font id=%s is defined differently in two parts; the first one was kept" % fid)
                     fonts.setdefault(fid, f)
-                # 颜色表：公共前缀之外的追加，并把本部件的索引改写过去
+                # colour table: append entries beyond the common prefix, and rewrite
+                # this part's indices to match
                 mine = _table(p.doc.header, "colortable")
                 remap = {}
                 for idx, c in enumerate(mine):
@@ -1055,16 +1147,18 @@ class Composer:
                             lambda m: '%s="%d"' % (attr, remap.get(int(m.group(1)),
                                                                    int(m.group(1)))),
                             body)
-                    self.notes.append("%s 的颜色索引重映射 %s" % (p.name, remap))
-            # Z：各引擎都从 1 开始重编，直接拼会让层序错乱。按声明顺序往上摞。
+                    self.notes.append("%s colour indices remapped %s" % (p.name, remap))
+            # Z: every engine renumbers from 1, so plain concatenation scrambles layer
+            # order. Stack in declaration order.
             if p.doc.max_z():
                 body = _shift_z(body, zbase)
                 zbase += p.doc.max_z()
             bodies.append(CORE._translate_body(body, p.dx, p.dy))
 
-        # 家具在**合表之后、重写表头之前**建：它的 [r,g,b] 要就地追加进 colors，
-        # 而 colors 下面几行就要写回表头去。发在所有部件之前，配合后面的 Z 重盖，
-        # 才真的在墨的后面。
+        # Furniture is built **after the tables are merged and before the header is
+        # rewritten**: its [r,g,b] must be appended to colors in place, and colors is
+        # written back to the header a few lines below. Emitted before all parts,
+        # together with the Z restamp later, it really ends up behind the ink.
         furn_xml, furn_boxes = self._build_furniture(colors)
         bodies = furn_xml + bodies
 
@@ -1075,67 +1169,79 @@ class Composer:
                       "<colortable>\n%s\n</colortable>" % "\n".join(colors),
                       head, flags=re.S)
 
-        # 父层自己画的那几根箭头。放在所有部件之后发，所以它压在上面 ——
-        # 它连接的是两个部件，被任何一个盖住都读不出来。
+        # The parent layer's own arrows. Emitted after all parts, so they sit on top -
+        # they connect two parts, and covered by either one they could not be read.
         links = self._build_links()
         bodies += [xml for xml, _pts in links]
 
         bs = [p.ink_bbox() for p in self.parts]
         cb = [min(b[0] for b in bs), min(b[1] for b in bs),
               max(b[2] for b in bs), max(b[3] for b in bs)]
-        for _xml, _pts in links:      # 页框要装得下它，否则 ChemDraw 会裁掉
+        for _xml, _pts in links:      # the page box must hold them, or ChemDraw clips them
             cb[0] = min(cb[0], min(q[0] for q in _pts))
             cb[1] = min(cb[1], min(q[1] for q in _pts))
             cb[2] = max(cb[2], max(q[0] for q in _pts))
             cb[3] = max(cb[3], max(q[1] for q in _pts))
-        for _b in furn_boxes:         # 同理：通栏条比墨宽，框比墨大
+        for _b in furn_boxes:         # likewise: full-width bars are wider than the ink, frames bigger than it
             if _b:
                 cb[0], cb[1] = min(cb[0], _b[0]), min(cb[1], _b[1])
                 cb[2], cb[3] = max(cb[2], _b[2]), max(cb[3], _b[3])
-        # 一次正象限平移 + 一个页框。引擎各自 finalize 过一遍，拼完又有负坐标，
-        # 而 ChemDraw 打开文件时把页原点钉在 (0,0) 并裁掉负的那部分。
+        # One positive-quadrant translation + one page box. Each engine already
+        # finalized once, and after stitching there are negative coordinates again, and
+        # when ChemDraw opens the file it pins the page origin at (0,0) and clips the
+        # negative part.
         ox, oy = self.margin - cb[0], self.margin - cb[1]
         body = CORE._translate_body("\n".join(bodies), ox, oy)
         if furn_xml:
-            # DOCUMENT ORDER IS NOT DRAWING ORDER —— cdxml_core.stamp_z 用三个
-            # 被光晕盖住的圆盘证过这件事。部件各自带着自己的 Z 进来，_shift_z
-            # 把它们摞起来；家具要压在所有墨的后面，光靠"发得早"办不到。
-            # 所以整篇 strip 一次、按文档顺序重盖一次，和 _add_graphics 在单个
-            # 引擎里做的是同一件事，同样**只在有家具时做**——没家具的图一个字节
-            # 都不动，否则每张现有图的 golden 都要重录。
+            # DOCUMENT ORDER IS NOT DRAWING ORDER - cdxml_core.stamp_z proved this with
+            # three discs covered by a halo. Parts come in each carrying its own Z, and
+            # _shift_z stacks them; furniture has to sit behind all ink, and "emitted
+            # early" alone cannot do that. So strip once over the whole body and restamp
+            # once in document order, the same thing _add_graphics does inside a single
+            # engine, and likewise **only when there is furniture** - a figure without
+            # furniture is not touched by a single byte, otherwise every existing
+            # figure's golden would have to be re-recorded.
             body = re.sub(r'\s+Z="\d+"', "", body)
             body, _znext = CORE.stamp_z(body)
         pw, ph = cb[2] - cb[0] + 2 * self.margin, cb[3] - cb[1] + 2 * self.margin
         return CORE.page(head, body, [0, 0, round(pw), round(ph)]), (ox, oy), (pw, ph)
 
-    # -- 跨部件家具 ---------------------------------------------------------
+    # -- cross-part furniture ------------------------------------------------
     #
-    # 为什么这一层非有不可：引擎那边的 `of: "figure"` 指的是**那一次调用画出来
-    # 的墨**。126 顶上那条深灰标题条要横跨整张图，它既不属于任何一次引擎调用，
-    # 也不是箭头——`_build_links` 之外，组合器原来没有第二样自己会画的东西。
+    # Why this layer is indispensable: the engine-side `of: "figure"` means **the ink
+    # drawn by that one call**. The dark-grey title bar across the top of 126 has to
+    # span the whole figure; it belongs to no single engine call, and it is not an arrow
+    # either - apart from `_build_links`, the composer had nothing else it drew itself.
     #
-    # 和引擎那边 `of`/`side` 用同一套词汇（above/below/left/right/center/around），
-    # 因为它们对读的人是同一件事。**唯一的差别写在这里**：组合层没有账本，所以
-    # 不搜索、不避让，按锚点算出来就落在那儿。真撞上了由 collisions() 报——那本来
-    # 就是"父层唯一知道两个引擎同时占了哪里的地方"。
+    # Same vocabulary as the engine-side `of`/`side`
+    # (above/below/left/right/center/around), because to the reader they are the same
+    # thing. **The only difference is written here**: the composer layer has no ledger,
+    # so it does not search or avoid; it lands wherever the anchor computation puts it.
+    # Real collisions are reported by collisions() - that is
+    # "the only place that knows where two engines both took space" anyway.
 
     _FURN_SIDES = ("above", "below", "left", "right", "center", "around")
 
     def graphic(self, kind, of="all", side="above", *, align="center",
                 gap=8.0, pad=6.0, box=None, span=None, name=None, **spec):
-        """一件跨部件家具。`of` / `span` 收部件名、家具名、名字列表，或 "all"。
+        """One piece of cross-part furniture. `of` / `span` accept a part name, a
+        furniture name, a list of names, or "all".
 
-        `of` 定位，`span` 定另一根轴的尺寸（不给就等于 `of`）。两者分开是因为
-        126 的通栏条要"压在 top 上面"但"和整张图一样宽"——一个锚点答不了。
+        `of` positions it, `span` sets the size on the other axis (defaults to `of`).
+        They are separate because 126's full-width bar has to "sit above top" but be "as
+        wide as the whole figure" - one anchor cannot answer both.
 
-        `box` 只给放置的 rect / line；某一轴写 None = 取 `span` 在那一轴的尺寸。
+        `box` applies only to placed rect / line; None on an axis = take `span`'s size
+        on that axis.
         """
         if side not in self._FURN_SIDES:
-            raise ValueError("side 是 %s 之一，收到 %r"
-                             % ("、".join(self._FURN_SIDES), side))
-        # 自动名 furn%d 也过这一关：调用者手写一个 "furn3" 之后，第 4 件家具的自动
-        # 名就会撞上它，而 _build_furniture 的 resolved 是个 dict，撞上就是静默覆盖。
-        name = self._claim(name or "furn%d" % len(self.furniture), "家具")
+            raise ValueError("side must be one of %s, got %r"
+                             % (" / ".join(self._FURN_SIDES), side))
+        # The automatic name furn%d goes through this check too: after a caller
+        # hand-writes "furn3", the 4th furniture's automatic name would collide with it,
+        # and _build_furniture's resolved is a dict, so a collision is a silent
+        # overwrite.
+        name = self._claim(name or "furn%d" % len(self.furniture), "furniture")
         self.furniture.append(dict(
             kind=kind, of=of, side=side, align=align, gap=float(gap),
             pad=float(pad), box=box, span=span, name=name, spec=spec))
@@ -1152,15 +1258,16 @@ class Composer:
             else:
                 boxes.append(self[n].ink_bbox())
         if not boxes:
-            raise ValueError("of=%r 没解析出任何东西" % (of,))
+            raise ValueError("of=%r resolved to nothing" % (of,))
         return [min(b[0] for b in boxes), min(b[1] for b in boxes),
                 max(b[2] for b in boxes), max(b[3] for b in boxes)]
 
     def _build_furniture(self, colors):
-        """(xml 列表, 盒子列表)。在部件的共享坐标系里，build() 最后统一平移。
+        """(list of xml, list of boxes). In the parts' shared coordinates; build() translates everything at the end.
 
-        `colors` 是合并后的色表，就地追加：家具的 [r,g,b] 和引擎那边走同一条路
-        （_add_graphics 的 _extend_palette），只是这里没有 tool layer，所以自己接。
+        `colors` is the merged colour table, appended in place: furniture [r,g,b] takes
+        the same path as on the engine side
+        (_add_graphics's _extend_palette), except there is no tool layer here, so it is wired up directly.
         """
         if not self.furniture:
             return [], []
@@ -1225,56 +1332,67 @@ class Composer:
         return out, boxes
 
     def size(self):
-        """当前摆位下，整张图的墨有多宽多高（还没落盘，纯量）。
+        """Width and height of the whole figure's ink under the current placement (not
+        written yet, pure measurement).
 
-        脚注要上交父层就得先知道"父层有多宽"，而那要等所有部件都摆好——
-        所以是两趟：先摆一趟量出宽度，再把宽度回传给那个背脚注的部件重画一次。
+        To hand footnotes up to the parent layer you first need to know "how wide the
+        parent is", and that waits until all parts are placed - so it takes two passes:
+        place once to measure the width, then pass the width back to the part carrying
+        the footnotes and redraw it.
         """
         bs = [p.ink_bbox() for p in self.parts]
         return (max(b[2] for b in bs) - min(b[0] for b in bs),
                 max(b[3] for b in bs) - min(b[1] for b in bs))
 
     def write(self, path):
-        # FIGDIR 改写落盘目录。每个图脚本都写在 ~/chemwand_figures 下，那是
-        # 人看图的地方；回归测试要写到自己的临时目录去，不该往那里灌文件。
+        # FIGDIR overrides the output directory. Every figure script writes under
+        # ~/chemwand_figures, which is where people look at figures; regression tests
+        # write to their own temp dir and should not flood that one.
         path = os.path.expanduser(path)
         _d = os.environ.get("FIGDIR")
         if _d:
             path = os.path.join(os.path.expanduser(_d), os.path.basename(path))
         doc, shift, size = self.build()
-        # 出门前查一遍 id 唯一。组合器给每个部件分了互不重叠的号段，所以这里
-        # 再撞上就说明**某个部件自己内部**就重了 —— 实测 draw_catalytic_cycle
-        # 一次画 N 个带装饰的结构，会发出 N 个 id 都等于 7000 的 <graphic>，
-        # 装饰号是按结构重新开始数的。那是引擎的账，但成品文件是我出的，得说出来。
-        # 从 <page ...> 这一标签**之后**开始数。页面自己就是 id="1"，而第 0 个部件
-        # 不加号段偏移（stride × 0），所以任何以 1 号原子开头的引擎——draw_molecule
-        # 就是——会被这条守卫误报一次。误报比漏报更糟：它会让真的重号看起来像噪音。
+        # Check id uniqueness before going out. The composer gives every part a
+        # non-overlapping id range, so a collision here means **some part is duplicated
+        # internally** - measured: draw_catalytic_cycle drawing N decorated structures
+        # in one call emits N <graphic>s all with id 7000, because decoration numbers
+        # restart per structure. That is the engine's business, but the finished file is
+        # mine, so it must be said. Count from **after** the <page ...> tag. The page
+        # itself is id="1", and part 0 gets no range offset (stride × 0), so any engine
+        # that starts with atom 1 - draw_molecule does - would trigger a false alarm
+        # from this guard. A false alarm is worse than a miss: it makes real duplicates
+        # look like noise.
         _body = doc[doc.index("<page"):]
         _ids = re.findall(r'\bid="(\d+)"', _body[_body.index(">") + 1:])
         _dup = sorted((i for i, n in Counter(_ids).items() if n > 1), key=int)
         if _dup:
-            self.notes.append("⚠ 成品里有重复 id %s —— 号段是分开的，所以是某个部件"
-                              "内部自己重了（装饰 id 按结构重数）" % _dup)
+            self.notes.append("⚠ duplicate ids %s in the finished figure - the id ranges are separate, so some part"
+                              " is duplicated internally (decoration ids restart per structure)" % _dup)
         open(path, "w").write(doc)
         col = self.collisions()
         near = [r for r in self.collisions(pad=5.0)
                 if not any(r["a"] == q["a"] and r["b"] == q["b"] for q in col)]
-        # 和 collisions 分成两栏端上来，不合并。合起来读的人就得自己分辨哪几条是
-        # "故意垫在下面"，而那正是 covered() 已经替他分完的那件事。
+        # Served up in a separate column from collisions, not merged. Merged, the reader
+        # would have to sort out which ones are
+        # "deliberately underneath", and that is exactly what covered() has already sorted for them.
         cov = self.covered()
         return {"path": path, "near": near, "covered": cov,
                 "dup_ids": _dup, "page": [round(size[0]), round(size[1])],
                 "parts": [{"name": p.name, "objs": len(p.kept()),
                            "at": [round(p.dx, 1), round(p.dy, 1)],
                            "warnings": p.report.get("warnings") or [],
-                           # 部件**自己**的 notes 也要端上来。组合器只看跨部件，
-                           # 部件内部的问题只有引擎自己的仪表看得见——#010 的电极
-                           # 压在 Int-B 上，引擎原话是 "graphics[5] (rect) covers
-                           # node:IntB (structure) by 7.0 pt"，而我只转了 warnings，
-                           # 就把唯一报出来的那句吞了。
+                           # The part's **own** notes must be served up too. The
+                           # composer only looks across parts; problems inside a part
+                           # are visible only to the engine's own instruments - #010's
+                           # electrode sits on Int-B, and the engine's own words are
+                           # "graphics[5] (rect) covers node:IntB (structure) by 7.0
+                           # pt", but I forwarded only warnings, and so swallowed the
+                           # one sentence that reported it.
                            "findings": _findings(p.report),
-                           # 和 findings 分两栏：findings 是"图元压住了结构"，
-                           # drift 是"你要的这件事根本没发生"。两件事，两个动作。
+                           # Separate column from findings: findings is "a graphic
+                           # covers a structure", drift is "the thing you asked for
+                           # never happened". Two things, two actions.
                            "drift": _drift(p.report)}
                           for p in self.parts],
                 "collisions": col, "conflicts": self.conflicts, "notes": self.notes}
