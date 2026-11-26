@@ -5509,7 +5509,7 @@ def merge_figures(files: list, filename: str = "merged", arrange: str = "column"
     if dup:
         rep["warnings"] = ["repeated object ids %s inside one of the inputs; "
                            "ChemDraw may misplace those objects" % dup[:10]]
-    if any(n.startswith("字体") for n in comp.notes):
+    if any(n.startswith("font id=") for n in comp.notes):
         rep.setdefault("warnings", []).append(
             "two figures define the same font id differently; the first one's was kept")
     return json.dumps(rep, indent=1, ensure_ascii=False)
